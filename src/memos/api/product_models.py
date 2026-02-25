@@ -294,8 +294,32 @@ class SearchRequest(BaseRequest):
     user_id: str = Field(..., description="User ID")
     query: str = Field(..., description="Search query")
     mem_cube_id: str | None = Field(None, description="Cube ID to search in")
-    top_k: int = Field(10, description="Number of results to return")
+    top_k: int = Field(10, ge=1, description="Number of results to return")
+    memory_limit_number: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "(Deprecated) Legacy alias for `top_k`. "
+            "Used by older clients and mapped to `top_k` if `top_k` is not explicitly provided."
+        ),
+    )
     session_id: str | None = Field(None, description="Session ID for soft-filtering memories")
+
+    @model_validator(mode="after")
+    def _convert_legacy_fields(self) -> "SearchRequest":
+        if self.memory_limit_number is not None:
+            if "top_k" not in self.model_fields_set:
+                self.top_k = self.memory_limit_number
+                logger.warning(
+                    "Deprecated field `memory_limit_number` is used in SearchRequest. "
+                    "Mapped to `top_k`. Please migrate to `top_k`."
+                )
+            else:
+                logger.warning(
+                    "Both `top_k` and deprecated `memory_limit_number` were provided in "
+                    "SearchRequest. Using `top_k` and ignoring `memory_limit_number`."
+                )
+        return self
 
 
 class APISearchRequest(BaseRequest):
@@ -336,6 +360,14 @@ class APISearchRequest(BaseRequest):
         10,
         ge=1,
         description="Number of textual memories to retrieve (top-K). Default: 10.",
+    )
+    memory_limit_number: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "(Deprecated) Legacy alias for `top_k`. "
+            "Mapped to `top_k` when `top_k` is not explicitly provided."
+        ),
     )
 
     relativity: float = Field(
@@ -484,10 +516,25 @@ class APISearchRequest(BaseRequest):
         """
         Convert deprecated fields to new fields for backward compatibility.
         Ensures full backward compatibility:
+            - memory_limit_number → top_k
             - mem_cube_id → readable_cube_ids
             - moscube is ignored with warning
             - operation ignored
         """
+        # Convert memory_limit_number to top_k when top_k is not explicitly set.
+        if self.memory_limit_number is not None:
+            if "top_k" not in self.model_fields_set:
+                self.top_k = self.memory_limit_number
+                logger.warning(
+                    "Deprecated field `memory_limit_number` is used in APISearchRequest. "
+                    "Mapped to `top_k`. Please migrate to `top_k`."
+                )
+            else:
+                logger.warning(
+                    "Both `top_k` and deprecated `memory_limit_number` were provided in "
+                    "APISearchRequest. Using `top_k` and ignoring `memory_limit_number`."
+                )
+
         # Convert mem_cube_id to readable_cube_ids (new field takes priority)
         if self.mem_cube_id is not None:
             if not self.readable_cube_ids:

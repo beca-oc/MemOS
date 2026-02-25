@@ -1,5 +1,8 @@
 import json
+import os
 import re
+import urllib.error
+import urllib.request
 
 from datetime import datetime
 from typing import Any
@@ -12,6 +15,41 @@ from memos.vec_dbs.item import VecDBItem
 
 
 logger = get_logger(__name__)
+
+
+def _embed_with_openai_fallback(text: str) -> list[float] | None:
+    """Best-effort embedding fallback when parser didn't attach one."""
+    backend = os.getenv("MOS_EMBEDDER_BACKEND", "")
+    provider = os.getenv("MOS_EMBEDDER_PROVIDER", "openai")
+    if backend != "universal_api" or provider != "openai":
+        return None
+
+    api_key = os.getenv("MOS_EMBEDDER_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    base_url = os.getenv("MOS_EMBEDDER_API_BASE", "https://api.openai.com/v1").rstrip("/")
+    model = os.getenv("MOS_EMBEDDER_MODEL", "nomic-embed-text-v1.5.Q4_K_M.gguf")
+    payload = {"model": model, "input": [text[:12000]]}
+    req = urllib.request.Request(
+        f"{base_url}/embeddings",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        data = body.get("data", [])
+        if not data:
+            return None
+        return data[0].get("embedding")
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+        logger.warning(f"[embedding_fallback] Failed embedding request: {exc}")
+        return None
 
 
 class Neo4jCommunityGraphDB(Neo4jGraphDB):
@@ -37,7 +75,7 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
         self,
         label: str = "Memory",
         vector_property: str = "embedding",
-        dimensions: int = 1536,
+        dimensions: int = 768,
         index_name: str = "memory_vector_index",
     ) -> None:
         """
@@ -60,12 +98,10 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
         metadata.setdefault("delete_time", "")
         metadata.setdefault("delete_record_id", "")
 
-        # serialization
-        if metadata["sources"]:
-            for idx in range(len(metadata["sources"])):
-                metadata["sources"][idx] = json.dumps(metadata["sources"][idx])
         # Extract required fields
         embedding = metadata.pop("embedding", None)
+        if embedding is None:
+            embedding = _embed_with_openai_fallback(memory)
         if embedding is None:
             raise ValueError(f"Missing 'embedding' in metadata for node {id}")
 
@@ -140,6 +176,8 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
                 metadata.setdefault("delete_record_id", "")
 
                 embedding = metadata.pop("embedding", None)
+                if embedding is None:
+                    embedding = _embed_with_openai_fallback(memory)
                 if embedding is None:
                     raise ValueError(f"Missing 'embedding' in metadata for node {node_id}")
 
@@ -841,7 +879,7 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
 
     def delete_node_by_prams(
         self,
-        writable_cube_ids: list[str],
+        writable_cube_ids: list[str] | None = None,
         memory_ids: list[str] | None = None,
         file_ids: list[str] | None = None,
         filter: dict | None = None,
@@ -850,7 +888,8 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
         Delete nodes by memory_ids, file_ids, or filter.
 
         Args:
-            writable_cube_ids (list[str]): List of cube IDs (user_name) to filter nodes. Required parameter.
+            writable_cube_ids (list[str], optional): List of cube IDs (user_name) to filter nodes.
+                If omitted, deletion is not restricted by user_name.
             memory_ids (list[str], optional): List of memory node IDs to delete.
             file_ids (list[str], optional): List of file node IDs to delete.
             filter (dict, optional): Filter dictionary to query matching nodes for deletion.
@@ -865,20 +904,17 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
             f"[delete_node_by_prams] memory_ids: {memory_ids}, file_ids: {file_ids}, filter: {filter}, writable_cube_ids: {writable_cube_ids}"
         )
 
-        # Validate writable_cube_ids
-        if not writable_cube_ids or len(writable_cube_ids) == 0:
-            raise ValueError("writable_cube_ids is required and cannot be empty")
-
         # Build WHERE conditions separately for memory_ids and file_ids
         where_clauses = []
         params = {}
 
         # Build user_name condition from writable_cube_ids (OR relationship - match any cube_id)
         user_name_conditions = []
-        for idx, cube_id in enumerate(writable_cube_ids):
-            param_name = f"cube_id_{idx}"
-            user_name_conditions.append(f"n.user_name = ${param_name}")
-            params[param_name] = cube_id
+        if writable_cube_ids and len(writable_cube_ids) > 0:
+            for idx, cube_id in enumerate(writable_cube_ids):
+                param_name = f"cube_id_{idx}"
+                user_name_conditions.append(f"n.user_name = ${param_name}")
+                params[param_name] = cube_id
 
         # Handle memory_ids: query n.id
         if memory_ids and len(memory_ids) > 0:
@@ -906,7 +942,7 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
                 filters=[],
                 user_name=None,
                 filter=filter,
-                knowledgebase_ids=writable_cube_ids,
+                knowledgebase_ids=writable_cube_ids if writable_cube_ids else None,
             )
 
         # If filter returned IDs, add condition for them
@@ -921,13 +957,17 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
             )
             return 0
 
-        # Build WHERE clause
+        # Build WHERE clause.
         # First, combine memory_ids, file_ids, and filter conditions with OR (any condition can match)
         data_conditions = " OR ".join([f"({clause})" for clause in where_clauses])
 
-        # Then, combine with user_name condition using AND (must match user_name AND one of the data conditions)
-        user_name_where = " OR ".join(user_name_conditions)
-        ids_where = f"({user_name_where}) AND ({data_conditions})"
+        # Then, combine with user_name condition using AND when provided.
+        # If user_name is not provided, delete purely by data conditions.
+        if user_name_conditions:
+            user_name_where = " OR ".join(user_name_conditions)
+            ids_where = f"({user_name_where}) AND ({data_conditions})"
+        else:
+            ids_where = data_conditions
 
         logger.info(
             f"[delete_node_by_prams] Deleting nodes - memory_ids: {memory_ids}, file_ids: {file_ids}, filter: {filter}"

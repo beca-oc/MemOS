@@ -43,7 +43,7 @@ services:
     volumes:
       - ../src:/app/src
       - .:/app/docker
-    restart: unless-stopped
+    restart: always
     cpus: "2.00"
     mem_limit: 2g
     mem_reservation: 1g
@@ -101,7 +101,7 @@ services:
     volumes:
       - ../src:/app/src
       - .:/app/docker
-    restart: unless-stopped
+    restart: always
     cpus: "1.00"
     mem_limit: 1g
     mem_reservation: 512m
@@ -117,12 +117,12 @@ services:
   redis:
     image: redis:7-alpine
     container_name: redis-docker
-    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--appendonly", "yes"]
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    restart: unless-stopped
+    restart: always
     cpus: "0.50"
     mem_limit: 384m
     mem_reservation: 128m
@@ -156,7 +156,7 @@ services:
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
-    restart: unless-stopped
+    restart: always
     cpus: "2.00"
     mem_limit: 2g
     mem_reservation: 1g
@@ -180,7 +180,7 @@ services:
     environment:
       QDRANT__SERVICE__GRPC_PORT: 6334
       QDRANT__SERVICE__HTTP_PORT: 6333
-    restart: unless-stopped
+    restart: always
     cpus: "1.50"
     mem_limit: 1500m
     mem_reservation: 512m

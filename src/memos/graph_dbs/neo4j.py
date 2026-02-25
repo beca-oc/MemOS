@@ -20,6 +20,29 @@ def _compose_node(item: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     return node_id, memory, metadata
 
 
+def _sanitize_neo4j_value(value: Any) -> Any:
+    """Convert values to Neo4j-compatible property types."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        sanitized_list = []
+        for item in value:
+            if item is None or isinstance(item, (str, int, float, bool)):
+                sanitized_list.append(item)
+            elif isinstance(item, datetime):
+                sanitized_list.append(item.isoformat())
+            elif isinstance(item, (dict, list)):
+                sanitized_list.append(json.dumps(item, ensure_ascii=False))
+            else:
+                sanitized_list.append(str(item))
+        return sanitized_list
+    return str(value)
+
+
 def _prepare_node_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     """
     Ensure metadata has proper datetime fields and normalized types.
@@ -38,10 +61,11 @@ def _prepare_node_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     if embedding and isinstance(embedding, list):
         metadata["embedding"] = [float(x) for x in embedding]
 
-    # serialization
-    if metadata["sources"]:
-        for idx in range(len(metadata["sources"])):
-            metadata["sources"][idx] = json.dumps(metadata["sources"][idx])
+    # Coerce all non-embedding fields to Neo4j-safe property types.
+    for key in list(metadata.keys()):
+        if key == "embedding":
+            continue
+        metadata[key] = _sanitize_neo4j_value(metadata[key])
     return metadata
 
 
@@ -116,7 +140,7 @@ class Neo4jGraphDB(BaseGraphDB):
         self,
         label: str = "Memory",
         vector_property: str = "embedding",
-        dimensions: int = 1536,
+        dimensions: int = 768,
         index_name: str = "memory_vector_index",
     ) -> None:
         """

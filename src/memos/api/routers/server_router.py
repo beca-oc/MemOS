@@ -64,6 +64,7 @@ router = APIRouter(prefix="/product", tags=["Server API"])
 
 # Instance ID for identifying this server instance in logs and responses
 INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}:{_random.randint(1000, 9999)}"
+READ_ONLY_MODE = os.getenv("MEMOS_READ_ONLY", "false").lower() == "true"
 
 # Initialize all server components
 components = handlers.init_server()
@@ -73,7 +74,7 @@ dependencies = HandlerDependencies.from_init_server(components)
 
 # Initialize all handlers with dependency injection
 search_handler = SearchHandler(dependencies)
-add_handler = AddHandler(dependencies)
+add_handler = AddHandler(dependencies) if not READ_ONLY_MODE else None
 chat_handler = (
     ChatHandler(
         dependencies,
@@ -82,10 +83,10 @@ chat_handler = (
         add_handler,
         online_bot=components.get("online_bot"),
     )
-    if os.getenv("ENABLE_CHAT_API", "false") == "true"
+    if (not READ_ONLY_MODE) and os.getenv("ENABLE_CHAT_API", "false") == "true"
     else None
 )
-feedback_handler = FeedbackHandler(dependencies)
+feedback_handler = FeedbackHandler(dependencies) if not READ_ONLY_MODE else None
 # Extract commonly used components for function-based handlers
 # (These can be accessed from the components dict without unpacking all of them)
 mem_scheduler: BaseScheduler = components["mem_scheduler"]
@@ -95,6 +96,14 @@ redis_client = components["redis_client"]
 status_tracker = TaskStatusTracker(redis_client=redis_client)
 graph_db = components["graph_db"]
 vector_db = components["vector_db"]
+
+
+def _ensure_writable(path: str) -> None:
+    if READ_ONLY_MODE:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{path} is disabled on read-only MemOS instance",
+        )
 
 
 # =============================================================================
@@ -125,6 +134,9 @@ def add_memories(add_req: APIADDRequest):
 
     This endpoint uses the class-based AddHandler for better code organization.
     """
+    _ensure_writable("/product/add")
+    if add_handler is None:
+        raise HTTPException(status_code=503, detail="Add handler is not available")
     return add_handler.handle_add_memories(add_req)
 
 
@@ -338,6 +350,7 @@ def get_memory_by_ids(memory_ids: list[str]):
     "/delete_memory", summary="Delete memories for user", response_model=DeleteMemoryResponse
 )
 def delete_memories(memory_req: DeleteMemoryRequest):
+    _ensure_writable("/product/delete_memory")
     return handlers.memory_handler.handle_delete_memories(
         delete_mem_req=memory_req, naive_mem_cube=naive_mem_cube
     )
@@ -355,6 +368,9 @@ def feedback_memories(feedback_req: APIFeedbackRequest):
 
     This endpoint uses the class-based FeedbackHandler for better code organization.
     """
+    _ensure_writable("/product/feedback")
+    if feedback_handler is None:
+        raise HTTPException(status_code=503, detail="Feedback handler is not available")
     return feedback_handler.handle_feedback_memories(feedback_req)
 
 
@@ -417,6 +433,7 @@ def chat_stream_business_user(chat_req: ChatBusinessRequest):
 )
 def delete_memory_by_record_id(memory_req: DeleteMemoryByRecordIdRequest):
     """(inner) Delete memory nodes by mem_cube_id (user_name) and delete_record_id. Record id is inner field, just for delete and recover memory, not for user to set."""
+    _ensure_writable("/product/delete_memory_by_record_id")
     graph_db.delete_node_by_mem_cube_id(
         mem_cube_id=memory_req.mem_cube_id,
         delete_record_id=memory_req.record_id,
@@ -437,6 +454,7 @@ def delete_memory_by_record_id(memory_req: DeleteMemoryByRecordIdRequest):
 )
 def recover_memory_by_record_id(memory_req: RecoverMemoryByRecordIdRequest):
     """(inner) Recover memory nodes by mem_cube_id (user_name) and delete_record_id. Record id is inner field, just for delete and recover memory, not for user to set."""
+    _ensure_writable("/product/recover_memory_by_record_id")
     graph_db.recover_memory_by_mem_cube_id(
         mem_cube_id=memory_req.mem_cube_id,
         delete_record_id=memory_req.delete_record_id,

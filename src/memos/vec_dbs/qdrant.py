@@ -81,15 +81,22 @@ class QdrantVecDB(BaseVecDB):
             "euclidean": models.Distance.EUCLID,
             "dot": models.Distance.DOT,
         }
+        hnsw_config = self._build_hnsw_config()
+        optimizers_config = self._build_optimizers_config()
+        create_kwargs: dict[str, Any] = {
+            "collection_name": self.config.collection_name,
+            "vectors_config": models.VectorParams(
+                size=self.config.vector_dimension,
+                distance=distance_map[self.config.distance_metric],
+            ),
+        }
+        if hnsw_config is not None:
+            create_kwargs["hnsw_config"] = hnsw_config
+        if optimizers_config is not None:
+            create_kwargs["optimizers_config"] = optimizers_config
 
         try:
-            self.client.create_collection(
-                collection_name=self.config.collection_name,
-                vectors_config=models.VectorParams(
-                    size=self.config.vector_dimension,
-                    distance=distance_map[self.config.distance_metric],
-                ),
-            )
+            self.client.create_collection(**create_kwargs)
         except UnexpectedResponse as err:
             # Cloud Qdrant returns 409 when the collection already exists; tolerate and continue.
             if getattr(err, "status_code", None) == 409 or "already exists" in str(err).lower():
@@ -105,6 +112,44 @@ class QdrantVecDB(BaseVecDB):
         logger.info(
             f"Collection '{self.config.collection_name}' created with {self.config.vector_dimension} dimensions."
         )
+        if hnsw_config is not None:
+            logger.info(f"Qdrant HNSW config applied for '{self.config.collection_name}': {hnsw_config}")
+        if optimizers_config is not None:
+            logger.info(
+                f"Qdrant optimizer config applied for '{self.config.collection_name}': {optimizers_config}"
+            )
+
+    def _build_hnsw_config(self) -> Any | None:
+        from qdrant_client.http import models
+
+        config_kwargs: dict[str, Any] = {}
+        if self.config.hnsw_m is not None:
+            config_kwargs["m"] = self.config.hnsw_m
+        if self.config.hnsw_ef_construct is not None:
+            config_kwargs["ef_construct"] = self.config.hnsw_ef_construct
+        if self.config.hnsw_full_scan_threshold is not None:
+            config_kwargs["full_scan_threshold"] = self.config.hnsw_full_scan_threshold
+        if self.config.hnsw_on_disk is not None:
+            config_kwargs["on_disk"] = self.config.hnsw_on_disk
+        if not config_kwargs:
+            return None
+        return models.HnswConfigDiff(**config_kwargs)
+
+    def _build_optimizers_config(self) -> Any | None:
+        from qdrant_client.http import models
+
+        config_kwargs: dict[str, Any] = {}
+        if self.config.optimizer_indexing_threshold is not None:
+            config_kwargs["indexing_threshold"] = self.config.optimizer_indexing_threshold
+        if self.config.optimizer_memmap_threshold is not None:
+            config_kwargs["memmap_threshold"] = self.config.optimizer_memmap_threshold
+        if self.config.optimizer_default_segment_number is not None:
+            config_kwargs["default_segment_number"] = self.config.optimizer_default_segment_number
+        if self.config.optimizer_flush_interval_sec is not None:
+            config_kwargs["flush_interval_sec"] = self.config.optimizer_flush_interval_sec
+        if not config_kwargs:
+            return None
+        return models.OptimizersConfigDiff(**config_kwargs)
 
     def list_collections(self) -> list[str]:
         """List all collections."""

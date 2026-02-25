@@ -29,6 +29,42 @@ class QdrantVecDBConfig(BaseVecDBConfig):
     path: str | None = Field(default=None, description="Path for Qdrant")
     url: str | None = Field(default=None, description="Qdrant Cloud/remote endpoint URL")
     api_key: str | None = Field(default=None, description="Qdrant Cloud API key")
+    hnsw_m: int | None = Field(
+        default=None, ge=1, description="Qdrant HNSW M parameter for collection creation"
+    )
+    hnsw_ef_construct: int | None = Field(
+        default=None,
+        ge=1,
+        description="Qdrant HNSW ef_construct parameter for collection creation",
+    )
+    hnsw_full_scan_threshold: int | None = Field(
+        default=None,
+        ge=0,
+        description="Qdrant HNSW full_scan_threshold parameter for collection creation",
+    )
+    hnsw_on_disk: bool | None = Field(
+        default=None, description="Whether Qdrant HNSW index should be on disk"
+    )
+    optimizer_indexing_threshold: int | None = Field(
+        default=None,
+        ge=0,
+        description="Qdrant optimizer indexing_threshold for collection creation",
+    )
+    optimizer_memmap_threshold: int | None = Field(
+        default=None,
+        ge=0,
+        description="Qdrant optimizer memmap_threshold for collection creation",
+    )
+    optimizer_default_segment_number: int | None = Field(
+        default=None,
+        ge=0,
+        description="Qdrant optimizer default_segment_number for collection creation",
+    )
+    optimizer_flush_interval_sec: int | None = Field(
+        default=None,
+        ge=0,
+        description="Qdrant optimizer flush_interval_sec for collection creation",
+    )
 
     @model_validator(mode="after")
     def set_default_path(self):

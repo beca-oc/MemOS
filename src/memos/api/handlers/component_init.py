@@ -65,6 +65,13 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _get_default_memory_size(cube_config: Any) -> dict[str, int]:
     """
     Get default memory size configuration.
@@ -134,9 +141,13 @@ def init_server() -> dict[str, Any]:
         existing code that uses the components.
     """
     logger.info("Initializing MemOS server components...")
+    read_only_mode = _env_bool("MEMOS_READ_ONLY", False)
+    lightweight_read_mode = _env_bool("MEMOS_LIGHTWEIGHT_READ_MODE", False) or read_only_mode
+    if lightweight_read_mode:
+        logger.info("Lightweight read mode enabled: scheduler/deepsearch/chat init will be skipped")
 
     # Initialize Redis client first as it is a core dependency for features like scheduler status tracking
-    if os.getenv("MEMSCHEDULER_USE_REDIS_QUEUE", "False").lower() == "true":
+    if (not lightweight_read_mode) and os.getenv("MEMSCHEDULER_USE_REDIS_QUEUE", "False").lower() == "true":
         try:
             from memos.mem_scheduler.orm_modules.api_redis_model import APIRedisDBManager
 
@@ -186,7 +197,7 @@ def init_server() -> dict[str, Any]:
     llm = LLMFactory.from_config(llm_config)
     chat_llms = (
         _init_chat_llms(chat_llm_config)
-        if os.getenv("ENABLE_CHAT_API", "false") == "true"
+        if (not lightweight_read_mode) and os.getenv("ENABLE_CHAT_API", "false") == "true"
         else None
     )
     embedder = EmbedderFactory.from_config(embedder_config)
@@ -316,43 +327,47 @@ def init_server() -> dict[str, Any]:
     # Set searcher to mem_reader
     mem_reader.set_searcher(searcher)
 
-    # Initialize feedback server
-    feedback_server = SimpleMemFeedback(
-        llm=llm,
-        embedder=embedder,
-        graph_store=graph_db,
-        memory_manager=memory_manager,
-        mem_reader=mem_reader,
-        searcher=searcher,
-        reranker=feedback_reranker,
-        pref_mem=pref_mem,
-    )
+    # Initialize feedback/scheduler stack only in full mode.
+    feedback_server = None
+    mem_scheduler = None
+    api_module = None
+    if not lightweight_read_mode:
+        feedback_server = SimpleMemFeedback(
+            llm=llm,
+            embedder=embedder,
+            graph_store=graph_db,
+            memory_manager=memory_manager,
+            mem_reader=mem_reader,
+            searcher=searcher,
+            reranker=feedback_reranker,
+            pref_mem=pref_mem,
+        )
 
-    # Initialize Scheduler
-    scheduler_config_dict = APIConfig.get_scheduler_config()
-    scheduler_config = SchedulerConfigFactory(
-        backend="optimized_scheduler", config=scheduler_config_dict
-    )
-    mem_scheduler: OptimizedScheduler = SchedulerFactory.from_config(scheduler_config)
-    mem_scheduler.initialize_modules(
-        chat_llm=llm,
-        process_llm=mem_reader.llm,
-        db_engine=BaseDBManager.create_default_sqlite_engine(),
-        mem_reader=mem_reader,
-        redis_client=redis_client,
-    )
-    mem_scheduler.init_mem_cube(
-        mem_cube=naive_mem_cube, searcher=searcher, feedback_server=feedback_server
-    )
-    logger.debug("Scheduler initialized")
+        # Initialize Scheduler
+        scheduler_config_dict = APIConfig.get_scheduler_config()
+        scheduler_config = SchedulerConfigFactory(
+            backend="optimized_scheduler", config=scheduler_config_dict
+        )
+        mem_scheduler: OptimizedScheduler = SchedulerFactory.from_config(scheduler_config)
+        mem_scheduler.initialize_modules(
+            chat_llm=llm,
+            process_llm=mem_reader.llm,
+            db_engine=BaseDBManager.create_default_sqlite_engine(),
+            mem_reader=mem_reader,
+            redis_client=redis_client,
+        )
+        mem_scheduler.init_mem_cube(
+            mem_cube=naive_mem_cube, searcher=searcher, feedback_server=feedback_server
+        )
+        logger.debug("Scheduler initialized")
 
-    # Initialize SchedulerAPIModule
-    api_module = mem_scheduler.api_module
+        # Initialize SchedulerAPIModule
+        api_module = mem_scheduler.api_module
 
-    # Start scheduler if enabled
-    if os.getenv("API_SCHEDULER_ON", "true").lower() == "true":
-        mem_scheduler.start()
-        logger.info("Scheduler started")
+        # Start scheduler if enabled
+        if os.getenv("API_SCHEDULER_ON", "true").lower() == "true":
+            mem_scheduler.start()
+            logger.info("Scheduler started")
 
     logger.info("MemOS server components initialized successfully")
 
@@ -364,10 +379,12 @@ def init_server() -> dict[str, Any]:
         online_bot = get_online_bot_function() if dingding_enabled else None
         logger.info("DingDing bot is enabled")
 
-    deepsearch_agent = DeepSearchMemAgent(
-        llm=llm,
-        memory_retriever=tree_mem,
-    )
+    deepsearch_agent = None
+    if not lightweight_read_mode:
+        deepsearch_agent = DeepSearchMemAgent(
+            llm=llm,
+            memory_retriever=tree_mem,
+        )
     # Return all components as a dictionary for easy access and extension
     return {
         "graph_db": graph_db,

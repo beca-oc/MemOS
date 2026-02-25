@@ -93,6 +93,32 @@ def get_config_value(path: str, default: Any | None = None) -> Any:
     return cur
 
 
+def get_optional_int_env(name: str) -> int | None:
+    """Read optional integer from env, returning None for unset/empty/invalid values."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Invalid int in env '{name}': {raw}. Ignoring value.")
+        return None
+
+
+def get_optional_bool_env(name: str) -> bool | None:
+    """Read optional boolean from env, returning None for unset/empty/invalid values."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning(f"Invalid bool in env '{name}': {raw}. Ignoring value.")
+    return None
+
+
 class NacosConfigManager:
     _client = None
     _data_id = None
@@ -428,28 +454,31 @@ class APIConfig:
     @staticmethod
     def get_embedder_config() -> dict[str, Any]:
         """Get embedder configuration."""
-        embedder_backend = os.getenv("MOS_EMBEDDER_BACKEND", "ollama")
+        embedder_backend = os.getenv("MOS_EMBEDDER_BACKEND", "universal_api")
 
         if embedder_backend == "universal_api":
+            local_model_default = "nomic-embed-text-v1.5.Q4_K_M.gguf"
             return {
                 "backend": "universal_api",
                 "config": {
                     "provider": os.getenv("MOS_EMBEDDER_PROVIDER", "openai"),
-                    "api_key": os.getenv("MOS_EMBEDDER_API_KEY", "sk-xxxx"),
-                    "model_name_or_path": os.getenv("MOS_EMBEDDER_MODEL", "text-embedding-3-large"),
+                    "api_key": os.getenv("MOS_EMBEDDER_API_KEY", "local-embedder"),
+                    "model_name_or_path": os.getenv("MOS_EMBEDDER_MODEL", local_model_default),
                     "headers_extra": json.loads(os.getenv("MOS_EMBEDDER_HEADERS_EXTRA", "{}")),
-                    "base_url": os.getenv("MOS_EMBEDDER_API_BASE", "http://openai.com"),
-                    "backup_client": os.getenv("MOS_EMBEDDER_BACKUP_CLIENT", "false").lower()
+                    "base_url": os.getenv(
+                        "MOS_EMBEDDER_API_BASE", "http://host.docker.internal:8010/v1"
+                    ),
+                    "backup_client": os.getenv("MOS_EMBEDDER_BACKUP_CLIENT", "true").lower()
                     == "true",
                     "backup_base_url": os.getenv(
-                        "MOS_EMBEDDER_BACKUP_API_BASE", "http://openai.com"
+                        "MOS_EMBEDDER_BACKUP_API_BASE", "http://127.0.0.1:8010/v1"
                     ),
-                    "backup_api_key": os.getenv("MOS_EMBEDDER_BACKUP_API_KEY", "sk-xxxx"),
+                    "backup_api_key": os.getenv("MOS_EMBEDDER_BACKUP_API_KEY", "local-embedder"),
                     "backup_headers_extra": json.loads(
                         os.getenv("MOS_EMBEDDER_BACKUP_HEADERS_EXTRA", "{}")
                     ),
                     "backup_model_name_or_path": os.getenv(
-                        "MOS_EMBEDDER_BACKUP_MODEL", "text-embedding-3-large"
+                        "MOS_EMBEDDER_BACKUP_MODEL", local_model_default
                     ),
                 },
             }
@@ -570,20 +599,40 @@ class APIConfig:
             "user_name": f"memos{user_id.replace('-', '')}",
             "auto_create": False,
             "use_multi_db": False,
-            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 1024)),
+            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 768)),
             "vec_config": {
                 # Pass nested config to initialize external vector DB
                 # If you use qdrant, please use Server instead of local mode.
                 "backend": "qdrant",
                 "config": {
-                    "collection_name": "neo4j_vec_db",
-                    "vector_dimension": int(os.getenv("EMBEDDING_DIMENSION", 1024)),
+                    "collection_name": os.getenv(
+                        "QDRANT_COLLECTION_NAME", "neo4j_vec_db_nomic_v1_5_768_v1"
+                    ),
+                    "vector_dimension": int(os.getenv("EMBEDDING_DIMENSION", 768)),
                     "distance_metric": "cosine",
                     "host": os.getenv("QDRANT_HOST", "localhost"),
                     "port": int(os.getenv("QDRANT_PORT", "6333")),
                     "path": os.getenv("QDRANT_PATH"),
                     "url": os.getenv("QDRANT_URL"),
                     "api_key": os.getenv("QDRANT_API_KEY"),
+                    "hnsw_m": get_optional_int_env("QDRANT_HNSW_M"),
+                    "hnsw_ef_construct": get_optional_int_env("QDRANT_HNSW_EF_CONSTRUCT"),
+                    "hnsw_full_scan_threshold": get_optional_int_env(
+                        "QDRANT_HNSW_FULL_SCAN_THRESHOLD"
+                    ),
+                    "hnsw_on_disk": get_optional_bool_env("QDRANT_HNSW_ON_DISK"),
+                    "optimizer_indexing_threshold": get_optional_int_env(
+                        "QDRANT_OPTIMIZER_INDEXING_THRESHOLD"
+                    ),
+                    "optimizer_memmap_threshold": get_optional_int_env(
+                        "QDRANT_OPTIMIZER_MEMMAP_THRESHOLD"
+                    ),
+                    "optimizer_default_segment_number": get_optional_int_env(
+                        "QDRANT_OPTIMIZER_DEFAULT_SEGMENT_NUMBER"
+                    ),
+                    "optimizer_flush_interval_sec": get_optional_int_env(
+                        "QDRANT_OPTIMIZER_FLUSH_INTERVAL_SEC"
+                    ),
                 },
             },
         }
@@ -606,7 +655,7 @@ class APIConfig:
             "password": os.getenv("NEO4J_PASSWORD", "12345678"),
             "auto_create": True,
             "use_multi_db": True,
-            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 3072)),
+            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 768)),
         }
 
     @staticmethod
@@ -620,7 +669,7 @@ class APIConfig:
             "user_name": f"memos{user_id.replace('-', '')}",
             "auto_create": True,
             "use_multi_db": False,
-            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 3072)),
+            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 768)),
         }
 
     @staticmethod
@@ -634,7 +683,7 @@ class APIConfig:
             "user_name": f"memos{user_id.replace('-', '')}",
             "use_multi_db": False,
             "auto_create": True,
-            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 3072)),
+            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 768)),
         }
 
     @staticmethod
@@ -644,7 +693,7 @@ class APIConfig:
                 "explicit_preference",
                 "implicit_preference",
             ],
-            "vector_dimension": int(os.getenv("EMBEDDING_DIMENSION", 1024)),
+            "vector_dimension": int(os.getenv("EMBEDDING_DIMENSION", 768)),
             "distance_metric": "cosine",
             "uri": os.getenv("MILVUS_URI", "http://localhost:19530"),
             "user_name": os.getenv("MILVUS_USER_NAME", "root"),
@@ -675,7 +724,7 @@ class APIConfig:
             "user_name": user_name,
             "use_multi_db": use_multi_db,
             "auto_create": True,
-            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 1024)),
+            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", 768)),
         }
 
     @staticmethod
@@ -698,7 +747,7 @@ class APIConfig:
             "schema_name": os.getenv("MEMOS_SCHEMA", "memos"),
             "user_name": user_name,
             "use_multi_db": False,
-            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", "384")),
+            "embedding_dimension": int(os.getenv("EMBEDDING_DIMENSION", "768")),
             "maxconn": int(os.getenv("POSTGRES_MAX_CONN", "20")),
         }
 
@@ -726,7 +775,8 @@ class APIConfig:
                 ),
                 "context_window_size": int(os.getenv("MOS_SCHEDULER_CONTEXT_WINDOW_SIZE", "5")),
                 "thread_pool_max_workers": int(
-                    os.getenv("MOS_SCHEDULER_THREAD_POOL_MAX_WORKERS", "10000")
+                    # Keep fallback conservative; huge defaults can exhaust container threads.
+                    os.getenv("MOS_SCHEDULER_THREAD_POOL_MAX_WORKERS", "50")
                 ),
                 "consume_interval_seconds": float(
                     os.getenv("MOS_SCHEDULER_CONSUME_INTERVAL_SECONDS", "0.01")

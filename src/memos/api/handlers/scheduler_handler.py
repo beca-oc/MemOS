@@ -36,7 +36,7 @@ logger = get_logger(__name__)
 
 
 def handle_scheduler_allstatus(
-    mem_scheduler: BaseScheduler,
+    mem_scheduler: BaseScheduler | None,
     status_tracker: TaskStatusTracker,
 ) -> AllStatusResponse:
     """
@@ -147,7 +147,7 @@ def handle_scheduler_allstatus(
         sched_cancelled = all_tasks_summary.cancelled
 
         # If queue monitor is available, prefer its live waiting/in_progress counts
-        if mem_scheduler.task_schedule_monitor:
+        if mem_scheduler is not None and mem_scheduler.task_schedule_monitor:
             queue_status_data = mem_scheduler.task_schedule_monitor.get_tasks_status() or {}
             scheduler_waiting = 0
             scheduler_in_progress = 0
@@ -247,9 +247,11 @@ def handle_scheduler_status(
 
 
 def handle_task_queue_status(
-    user_id: str, mem_scheduler: OptimizedScheduler, task_id: str | None = None
+    user_id: str, mem_scheduler: OptimizedScheduler | None, task_id: str | None = None
 ) -> TaskQueueResponse:
     try:
+        if mem_scheduler is None:
+            raise HTTPException(status_code=503, detail="Scheduler is not available")
         queue_wrapper = getattr(mem_scheduler, "memos_message_queue", None)
         if queue_wrapper is None:
             raise HTTPException(status_code=503, detail="Scheduler queue is not available")

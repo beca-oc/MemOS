@@ -153,6 +153,22 @@ class TextualMemoryMetadata(BaseModel):
         description="Record the memory id covered by the update",
     )
 
+    @field_validator("info", mode="before")
+    @classmethod
+    def coerce_info(cls, v):
+        if v is None or isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            text = v.strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return v
+
     def __str__(self) -> str:
         """Pretty string representation of the metadata."""
         meta = self.model_dump(exclude_none=True)

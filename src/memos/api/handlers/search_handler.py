@@ -7,6 +7,7 @@ using dependency injection for better modularity and testability.
 
 import copy
 import math
+import os
 
 from typing import Any
 
@@ -40,9 +41,41 @@ class SearchHandler(BaseHandler):
             dependencies: HandlerDependencies instance
         """
         super().__init__(dependencies)
-        self._validate_dependencies(
-            "naive_mem_cube", "mem_scheduler", "searcher", "deepsearch_agent"
+        self._validate_dependencies("naive_mem_cube", "mem_reader", "searcher")
+        self._dedup_candidate_multiplier = self._env_int(
+            "MOS_SEARCH_DEDUP_CANDIDATE_MULTIPLIER", 5, minimum=1
         )
+        self._dedup_candidate_cap = self._env_int("MOS_SEARCH_DEDUP_CANDIDATE_CAP", 60, minimum=1)
+        self._enable_rerank = self._env_bool("MOS_SEARCH_ENABLE_RERANK", True)
+        self._allow_embedding_recompute = self._env_bool(
+            "MOS_SEARCH_ALLOW_EMBEDDING_RECOMPUTE", True
+        )
+        default_dedup = os.getenv("MOS_SEARCH_DEFAULT_DEDUP", "").strip().lower()
+        self._default_dedup = default_dedup or None
+        if self._default_dedup not in (None, "no", "sim", "mmr"):
+            self.logger.warning(
+                "[SearchHandler] Invalid MOS_SEARCH_DEFAULT_DEDUP=%s; ignoring",
+                self._default_dedup,
+            )
+            self._default_dedup = None
+
+    @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _env_int(name: str, default: int, minimum: int = 1) -> int:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            return default
+        return max(minimum, value)
 
     def handle_search_memories(self, search_req: APISearchRequest) -> SearchResponse:
         """
@@ -61,10 +94,29 @@ class SearchHandler(BaseHandler):
 
         # Use deepcopy to avoid modifying the original request object
         search_req_local = copy.deepcopy(search_req)
+        requested_top_k = max(1, int(search_req.top_k))
+        pref_top_k = max(0, int(getattr(search_req_local, "pref_top_k", 6)))
 
-        # Expand top_k for deduplication (5x to ensure enough candidates)
+        if self._default_dedup and (
+            "dedup" not in search_req_local.model_fields_set or search_req_local.dedup is None
+        ):
+            search_req_local.dedup = self._default_dedup
+
+        # Expand top_k for deduplication with cap to avoid overfetch explosions.
         if search_req_local.dedup in ("sim", "mmr"):
-            search_req_local.top_k = search_req_local.top_k * 5
+            search_req_local.top_k = min(
+                max(requested_top_k, requested_top_k * self._dedup_candidate_multiplier),
+                self._dedup_candidate_cap,
+            )
+        else:
+            search_req_local.top_k = requested_top_k
+
+        # Lightweight read instances do not initialize scheduler/deepsearch.
+        if self.mem_scheduler is None and str(search_req_local.mode).lower() != "fast":
+            self.logger.warning(
+                "[SearchHandler] Scheduler unavailable in lightweight mode; forcing fast search"
+            )
+            search_req_local.mode = "fast"
 
         # Search and deduplicate
         cube_view = self._build_cube_view(search_req_local)
@@ -75,21 +127,23 @@ class SearchHandler(BaseHandler):
         results = self._apply_relativity_threshold(results, search_req_local.relativity)
 
         if search_req_local.dedup == "sim":
-            results = self._dedup_text_memories(results, search_req.top_k)
+            results = self._dedup_text_memories(results, requested_top_k)
             self._strip_embeddings(results)
         elif search_req_local.dedup == "mmr":
-            pref_top_k = getattr(search_req_local, "pref_top_k", 6)
-            results = self._mmr_dedup_text_memories(results, search_req.top_k, pref_top_k)
+            results = self._mmr_dedup_text_memories(results, requested_top_k, pref_top_k)
             self._strip_embeddings(results)
 
-        text_mem = results["text_mem"]
-        results["text_mem"] = rerank_knowledge_mem(
-            self.reranker,
-            query=search_req.query,
-            text_mem=text_mem,
-            top_k=search_req_local.top_k,
-            file_mem_proportion=0.5,
-        )
+        if self._enable_rerank:
+            text_mem = results.get("text_mem", [])
+            results["text_mem"] = rerank_knowledge_mem(
+                self.reranker,
+                query=search_req.query,
+                text_mem=text_mem,
+                top_k=requested_top_k,
+                file_mem_proportion=0.5,
+            )
+        else:
+            results = self._truncate_memories(results, requested_top_k, pref_top_k)
 
         self.logger.info(
             f"[SearchHandler] Final search results: count={len(results)} results={results}"
@@ -153,6 +207,11 @@ class SearchHandler(BaseHandler):
 
         embeddings = self._extract_embeddings([mem for _, mem, _ in flat])
         if embeddings is None:
+            if not self._allow_embedding_recompute:
+                self.logger.warning(
+                    "[SearchHandler] Embedding missing; skipping sim dedup recompute path"
+                )
+                return self._truncate_memories(results, text_top_k=target_top_k)
             documents = [mem.get("memory", "") for _, mem, _ in flat]
             embeddings = self.searcher.embedder.embed(documents)
 
@@ -238,6 +297,11 @@ class SearchHandler(BaseHandler):
         # Get or compute embeddings
         embeddings = self._extract_embeddings([mem for _, _, mem, _ in flat])
         if embeddings is None:
+            if not self._allow_embedding_recompute:
+                self.logger.warning(
+                    "[SearchHandler] Embedding missing; skipping MMR recompute path"
+                )
+                return self._truncate_memories(results, text_top_k=text_top_k, pref_top_k=pref_top_k)
             self.logger.warning("[SearchHandler] Embedding is missing; recomputing embeddings")
             documents = [mem.get("memory", "") for _, _, mem, _ in flat]
             embeddings = self.searcher.embedder.embed(documents)
@@ -423,6 +487,30 @@ class SearchHandler(BaseHandler):
                         metadata = mem.get("metadata", {})
                         if "embedding" in metadata:
                             metadata["embedding"] = []
+
+    @staticmethod
+    def _truncate_memories(
+        results: dict[str, Any], text_top_k: int, pref_top_k: int | None = None
+    ) -> dict[str, Any]:
+        text_limit = max(0, int(text_top_k))
+        pref_limit = None if pref_top_k is None else max(0, int(pref_top_k))
+
+        for bucket in results.get("text_mem", []):
+            memories = bucket.get("memories", [])
+            if isinstance(memories, list):
+                bucket["memories"] = memories[:text_limit]
+                if "total_nodes" in bucket:
+                    bucket["total_nodes"] = len(bucket["memories"])
+
+        if pref_limit is not None:
+            for bucket in results.get("pref_mem", []):
+                memories = bucket.get("memories", [])
+                if isinstance(memories, list):
+                    bucket["memories"] = memories[:pref_limit]
+                    if "total_nodes" in bucket:
+                        bucket["total_nodes"] = len(bucket["memories"])
+
+        return results
 
     @staticmethod
     def _dice_similarity(text1: str, text2: str) -> float:
